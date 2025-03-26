@@ -1,23 +1,24 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file, session
 from flask_mysqldb import MySQL
 from werkzeug.security import generate_password_hash, check_password_hash
-import jwt as pyjwt
+import jwt
 import datetime
 from functools import wraps
-import os
+import pyotp
+import qrcode
+from io import BytesIO
 
 app = Flask(__name__)
-
 
 app.config['MYSQL_HOST'] = 'localhost'
 app.config['MYSQL_USER'] = 'root'
 app.config['MYSQL_PASSWORD'] = ''  
-app.config['MYSQL_DB'] = 'infosec_task2'
+app.config['MYSQL_DB'] = 'data_task1'
 app.config['MYSQL_CURSORCLASS'] = 'DictCursor'  
 app.config['SECRET_KEY'] = 'your_secret_key'
+app.config['SESSION_TYPE'] = 'filesystem'
 
 mysql = MySQL(app)
-
 
 def token_required(f):
     @wraps(f)
@@ -25,113 +26,99 @@ def token_required(f):
         token = request.headers.get('Authorization')
         if not token:
             return jsonify({'message': 'Token is missing!'}), 401
+        
+        
+        token = token.replace('Bearer ', '').strip()
+        
         try:
-            data = pyjwt.decode(token.split(' ')[1], app.config['SECRET_KEY'], algorithms=['HS256'])
+            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
         except:
             return jsonify({'message': 'Invalid token!'}), 403
+        
         return f(*args, **kwargs)
     return decorated
 
-
+# Signup Route
 @app.route('/signup', methods=['POST'])
 def signup():
-    try:
-        if not request.is_json:
-            return jsonify({'message': 'Request must be JSON'}), 400
+    data = request.get_json()
+    username = data.get('username')
+    password = data.get('password')
 
-        data = request.get_json()
-        print("Received Data:", data) 
+    if not username or not password:
+        return jsonify({'message': 'Missing username or password'}), 400
 
-        if not data or 'name' not in data or 'username' not in data or 'password' not in data:
-            return jsonify({'message': 'Missing fields'}), 400
+    hashed_password = generate_password_hash(password, method='pbkdf2:sha256')
+    secret = pyotp.random_base32()
 
-        hashed_password = generate_password_hash(data['password'], method='pbkdf2:sha256')  
-        cur = mysql.connection.cursor()
-        cur.execute("INSERT INTO users (name, username, password) VALUES (%s, %s, %s)",
-                    (data['name'], data['username'], hashed_password))
-        mysql.connection.commit()
-        cur.close()
+    cur = mysql.connection.cursor()
+    cur.execute("INSERT INTO users (username, password, twofa_secret) VALUES (%s, %s, %s)",
+                (username, hashed_password, secret))
+    mysql.connection.commit()
+    cur.close()
 
-        return jsonify({'message': 'User registered successfully'}), 201
+    return jsonify({'message': 'User registered successfully. Please login to get QR code.'})
 
-    except Exception as e:
-        print("Error:", str(e))  
-        return jsonify({'error': str(e)}), 500
-
-
+# Login Route
 @app.route('/login', methods=['POST'])
 def login():
-    try:
-        if not request.is_json:
-            return jsonify({'message': 'Request must be JSON'}), 400
+    data = request.get_json()
+    username = data.get('username')
+    password = data.get('password')
 
-        data = request.get_json()
-        print("Received Data:", data)  
+    cur = mysql.connection.cursor()
+    cur.execute("SELECT * FROM users WHERE username = %s", (username,))
+    user = cur.fetchone()
+    cur.close()
 
-        if not data or 'username' not in data or 'password' not in data:
-            return jsonify({'message': 'Missing fields'}), 400
+    if not user or not check_password_hash(user['password'], password):
+        return jsonify({'message': 'Invalid username or password'}), 401
 
-        cur = mysql.connection.cursor()
-        cur.execute("SELECT * FROM users WHERE username = %s", (data['username'],))
-        user = cur.fetchone()
-        cur.close()
+    session.clear()
 
-        
-        if not user:
-            return jsonify({'message': 'Invalid username or password'}), 401
+ 
+    session['username'] = username
 
-        
-        if not check_password_hash(user['password'], data['password']):
-            return jsonify({'message': 'Invalid username or password'}), 401
+    otp_auth_url = pyotp.totp.TOTP(user['twofa_secret']).provisioning_uri(username, issuer_name="FlaskApp")
+    qr = qrcode.make(otp_auth_url)
+    buffer = BytesIO()
+    qr.save(buffer, format="PNG")
+    buffer.seek(0)
 
-        
-        token = pyjwt.encode(
-            {'id': user['id'], 'exp': datetime.datetime.utcnow() + datetime.timedelta(minutes=10)},
-            app.config['SECRET_KEY'], 
-            algorithm='HS256'
-        )
+    return send_file(buffer, mimetype='image/png')
 
-        return jsonify({'token': token})
+# Verify OTP Route
+@app.route('/verify_otp', methods=['POST'])
+def verify_otp():
+    if 'username' not in session:
+        return jsonify({'message': 'Session expired. Please login again.'}), 401
 
-    except Exception as e:
-        print("Error:", str(e))  
-        return jsonify({'error': str(e)}), 500
+    username = session['username']
+    data = request.get_json()
+    otp_code = data.get('otp')
 
+    cur = mysql.connection.cursor()
+    cur.execute("SELECT * FROM users WHERE username = %s", (username,))
+    user = cur.fetchone()
+    cur.close()
 
-@app.route('/users/<int:id>', methods=['PUT'])
-@token_required
-def update_user(id):
-    try:
-        if not request.is_json:
-            return jsonify({'message': 'Request must be JSON'}), 400
+    totp = pyotp.TOTP(user['twofa_secret'])
+    if not totp.verify(otp_code):
+        return jsonify({'message': 'Invalid OTP code'}), 401
 
-        data = request.get_json()
-        print("Received Data:", data)  
+    
+    token = jwt.encode({'id': user['id'], 'exp': datetime.datetime.utcnow() + datetime.timedelta(minutes=10)},
+                        app.config['SECRET_KEY'], algorithm='HS256')
 
-        if not data or 'name' not in data or 'username' not in data:
-            return jsonify({'message': 'Missing fields'}), 400
-
-        cur = mysql.connection.cursor()
-        cur.execute("UPDATE users SET name=%s, username=%s WHERE id=%s", 
-                    (data['name'], data['username'], id))
-        mysql.connection.commit()
-        cur.close()
-
-        return jsonify({'message': 'User updated successfully'}), 200
-
-    except Exception as e:
-        print("Error:", str(e)) 
-        return jsonify({'error': str(e)}), 500
-
-
-
+    return jsonify({'token': token})
 
 @app.route('/products', methods=['POST'])
 @token_required
 def add_product():
-    data = request.json
+    data = request.get_json()
     cur = mysql.connection.cursor()
-    cur.execute("INSERT INTO products (pname, description, price, stock, created_at) VALUES (%s, %s, %s, %s, NOW())", (data['pname'], data['description'], data['price'], data['stock']))
+    cur.execute("INSERT INTO products (name, description, price, quantity) VALUES (%s, %s, %s, %s)",
+                (data['name'], data['description'], data['price'], data['quantity']))
     mysql.connection.commit()
     cur.close()
     return jsonify({'message': 'Product added successfully'})
@@ -145,35 +132,25 @@ def get_products():
     cur.close()
     return jsonify(products)
 
-@app.route('/products/<int:pid>', methods=['GET'])
+@app.route('/products/<int:product_id>', methods=['PUT'])
 @token_required
-def get_product(pid):
+def update_product(product_id):
+    data = request.get_json()
     cur = mysql.connection.cursor()
-    cur.execute("SELECT * FROM products WHERE pid = %s", (pid,))
-    product = cur.fetchone()
-    cur.close()
-    if not product:
-        return jsonify({'message': 'Product not found'}), 404
-    return jsonify(product)
-
-@app.route('/products/<int:pid>', methods=['PUT'])
-@token_required
-def update_product(pid):
-    data = request.json
-    cur = mysql.connection.cursor()
-    cur.execute("UPDATE products SET pname=%s, description=%s, price=%s, stock=%s WHERE pid=%s", (data['pname'], data['description'], data['price'], data['stock'], pid))
+    cur.execute("UPDATE products SET name=%s, description=%s, price=%s, quantity=%s WHERE id=%s",
+                (data['name'], data['description'], data['price'], data['quantity'], product_id))
     mysql.connection.commit()
     cur.close()
     return jsonify({'message': 'Product updated successfully'})
 
-@app.route('/products/<int:pid>', methods=['DELETE'])
+@app.route('/products/<int:product_id>', methods=['DELETE'])
 @token_required
-def delete_product(pid):
+def delete_product(product_id):
     cur = mysql.connection.cursor()
-    cur.execute("DELETE FROM products WHERE pid = %s", (pid,))
+    cur.execute("DELETE FROM products WHERE id = %s", (product_id,))
     mysql.connection.commit()
     cur.close()
     return jsonify({'message': 'Product deleted successfully'})
 
-if __name__ == '__main__':  # Correct way to check main script
+if __name__ == '__main__':
     app.run(debug=True)
