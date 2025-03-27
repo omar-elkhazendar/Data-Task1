@@ -20,6 +20,7 @@ app.config['SESSION_TYPE'] = 'filesystem'
 
 mysql = MySQL(app)
 
+
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):

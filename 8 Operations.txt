@@ -1,0 +1,37 @@
+1-POST
+http://127.0.0.1:5000/signup
+{
+  "username": "omar",
+  "password": "omar123"
+}
+2-post
+http://127.0.0.1:5000/login
+{
+  "username": "omar",
+  "password": "omar123"
+}
+3-post
+verify_otp
+{
+  "otp": "123456"8
+}
+4-POST 
+products
+{
+  "name": "Gaming Laptop",
+  "description": "Gaming Laptop",
+  "price": 1700,
+  "quantity": 12
+}
+5-GET 
+products
+6-PUT 
+products/1
+{
+  "name": "The Updated Laptop",
+  "description": "Something Better",
+  "price": 1800,
+  "quantity": 8
+}
+7-DELETE 
+products/1
